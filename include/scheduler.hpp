@@ -11,6 +11,7 @@
 #include "OwnedNode.hpp"
 #include "PresenceCache.hpp"
 #include "ProbeCadence.hpp"
+#include "LoadGovernor.hpp"
 #include "ThermalDecision.hpp"
 #include "IdleUclamp.hpp"
 #include "PowerBoostNode.hpp"
@@ -89,6 +90,15 @@ private:
     AutoModeCtl autoMode_{logger};
     AutoFsm     autoFsm_{logger};
     AutoFas     autoFas_{logger};
+    // ── 负载闭环调频（P0-2 / P0-3）────────────────────────────────────────────
+    // 算法在 include/LoadGovernor.hpp（零 IO 纯函数, 主机单测 kin_load_governor）。
+    // 定位：**只能收紧**的一层 cap —— 叠在 FSM 预算之内（取 min）, 不参与预算制定,
+    // 因此与 FAS / 类别钳制 / 相机 / 热保护 / PolicyResolver 天然兼容（都是取 min）。
+    // 只覆盖 little(0)/big(1)：AutoFsm::Caps 只建模这两簇, prime 由 writeFsmCaps 按 maxB 等比缩放。
+    kin::LoadGovParams loadGovParams_;
+    kin::LoadGovState  loadGov_[2];
+    bool               loadGovPrimed_[2]     = { false, false };
+    long long          loadGovLastWriteMs_[2] = { 0, 0 };
     kin::DndControl dnd_;            // 游戏态自动免打扰(默认关, config auto_dnd)
     std::string lastModeLogged_;   // 仅在情景模式真正变化时打印, 避免配置重载刷屏
     SysTweaks   sysTweaks_{logger, utils};   // ASB 非 CPU 调优(VM/网络/WiFi/停服务/BG_TRIM)
@@ -1473,6 +1483,8 @@ public:
         int lastGpuMax = -1;          // 每状态 GPU 上限去重
         bool fengchiActive = false;   // 风驰游戏态是否在位(边沿: 进出沿清 GPU min 去重, 让 FSM 重新接管)
         bool fsmPrimed = false;       // 是否已为 FSM 预置基础档(governor/schedparam/gpu)
+        int  lastScreenOn = -1;       // 上一拍亮灭屏状态(供息屏→亮屏沿复位负载闭环)
+        long long lastFsmMs = 0;      // 上次推进 FSM 状态机的时刻(见下方 fsmDue)
         bool fasWasGaming = false;    // FAS 是否已进入 GAMING 会话(用于进/出沿)
         std::string fasPkg;           // FAS 会话绑定的游戏包(换包沿=重开会话); 只记非空包
         int  frameGpuStreak = 0;      // 帧时辅助进入: GPU≥地板 连续 tick 数(防滚动突发误入)
@@ -1490,6 +1502,7 @@ public:
                 stickyGame.clear();   // 退 auto: 粘滞归零(对称 fasWasGaming)
                 fengchiGovResetPending_ = false;   // 退 auto: 清热重载标志(对称 fengchiActive)
                 if (fasWasGaming) { autoFas_.onExitGaming(); fasWasGaming = false; }
+                resetLoadGovernor();   // 退出 auto: 闭环状态归零, 下次进 auto 从当时的 FSM 预算重新起步
                 // 退出 auto: 退出路径(onModeChanged→primeAutoFsm/online)已按非 auto 档处理核心,
                 // 这里只把去重缓存复位为全 1, 下次进 auto 不因陈旧缓存漏掉一次上线。
                 // 必须持 applyMtx: fileWatch 线程经 onModeChanged→onlineAll 在锁内写同一数组(避免 data race)。
@@ -1509,7 +1522,20 @@ public:
             }
             const unsigned long long tickGeneration = configGeneration_.load(std::memory_order_acquire);
             AutoModeCtl::Metrics mx = autoMode_.sample();
-            autoMode_.accountTick(mx);   // 会话学习(两种子模式都做)
+
+            // ── FSM 节奏与负载闭环解耦 ──────────────────────────────────────────────
+            // LoadGovernor 需要快拍(600ms), 但 AutoFsm 的确认窗口是按 **tick 数** 标定的:
+            //   UP_WINDOW=2 (注释口径 ×2s = 4s)、DOWN_WINDOW=5 (×2s = 10s)、
+            //   kPairConfirmWindow=3、最小驻留则是墙钟秒(不受影响)。
+            // 若 tick 缩短到 600ms 后仍每拍都推进状态机, 等价于把升档压到 1.2s、降档压到 3s,
+            // 状态机会明显 churn(上游现场日志已证: MODERATE↔HEAVY 来回本身就是主要抖动源)。
+            // 故状态机与账号记账仍按 kFsmTickMs(2s) 抽帧, 只有采样 + 闭环 + 写频跑快拍。
+            const long long tickNowMs = (long long)nowMs();
+            const bool fsmDue = (lastFsmMs == 0) || (tickNowMs - lastFsmMs >= kFsmTickMs);
+            if (fsmDue) {
+                autoMode_.accountTick(mx);   // 会话学习(两种子模式都做) —— 按 2s 节奏, 保持原语义
+                lastFsmMs = tickNowMs;
+            }
 
             // 配置热重载在 applyMtx 内重写字符串和策略表；本 tick 复制标量快照，
             // 避免锁外读取配置对象，同时不把慢速前台与 sysfs 探测放进锁内。
@@ -1526,6 +1552,8 @@ public:
                 int quietNightTickMs;
                 int fsmSustainedEnter;
                 int gameUclampMin;
+                bool loadGovEnable;
+                int  loadGovTickMs;
             } tickCfg;
             {
                 std::lock_guard<std::recursive_mutex> lk(applyMtx);
@@ -1541,7 +1569,16 @@ public:
                 tickCfg.quietNightTickMs = Config::AutoMode::quiet_night_tick_ms;
                 tickCfg.fsmSustainedEnter = Config::AutoMode::fsm_sustained_enter;
                 tickCfg.gameUclampMin = Config::AutoMode::game_uclamp_min;
+                tickCfg.loadGovEnable = Config::AutoMode::loadgov_enable;
+                tickCfg.loadGovTickMs = Config::AutoMode::loadgov_tick_ms;
             }
+
+            // 息屏→亮屏沿: 复位负载闭环状态。
+            // 息屏期间 FSM 在 DEEP_IDLE(LEVEL 0.0), 预算被压到最低; 若带着那时的 currentPerf 醒来,
+            // 闭环要爬好几个 tick 才回到可用上限(升频确认 3 tick + 平滑), 亮屏首秒会明显不跟手。
+            // 复位后从"当时的预算"直接起步。
+            if (mx.screenOn != 0 && lastScreenOn == 0) resetLoadGovernor();
+            lastScreenOn = mx.screenOn;
 
             // 注入前台包名(供 App 发热学习 / 凉爽游戏 / gameHint 复用)。仅亮屏取 —— 息屏省去
             // dumpsys 开销, 且避免把 launcher/null 误学成热 App(息屏温度本就在降)。
@@ -1750,7 +1787,9 @@ public:
                     mx.tempC, mx.skinC, Config::AutoMode::thermal_skin_gate,
                     Config::AutoMode::veto_temp, Config::AutoMode::skin_temp,
                     Config::AutoMode::junction_hard_temp);
-                bool changed = autoFsm_.update(mx.gpuPct, mx.load1, autoMode_.thermalDecisionC(mx), mx.screenOn, fsmCpu, gameHint,
+                // 仅在 fsmDue 拍推进状态机(见上方说明); 非 fsmDue 拍保持现有状态, 只让闭环调频继续跑。
+                bool changed = false;
+                if (fsmDue) changed = autoFsm_.update(mx.gpuPct, mx.load1, autoMode_.thermalDecisionC(mx), mx.screenOn, fsmCpu, gameHint,
                                                mx.currentMa, mx.charging, fgNotGame, thermalDisputed);
                 AutoFsm::Caps caps = autoFsm_.computeCaps(alpha);
 
@@ -1778,6 +1817,22 @@ public:
                     int v = (int)((long)autoFsm_.hwMaxB() * fpol.maxB / 100);
                     caps.maxB = v < autoFsm_.hwMinB() ? autoFsm_.hwMinB() : v;
                     if (caps.minB > caps.maxB) caps.minB = caps.maxB;
+                }
+
+                // ── 负载闭环调频（P0-2 / P0-3）：在预算内按本簇负载收紧上限 ──
+                // 必须放在用户 fsm_policy 覆盖之后：fsm_policy 是用户配的**预算**，闭环只能在预算内收紧。
+                // 后面 FAS / 类别钳制 / 相机 / 热 / PolicyResolver 仍会继续取 min，顺序不受影响。
+                applyLoadGovernor(caps, mx.clusterBusy, tickNowMs);
+                // 闭环可观测性: 只在 FSM 拍打一行(与状态机同节奏, 不随快拍刷屏)。
+                // 判读口径: perf 是该簇闭环算出的上限占硬件最高频的比例, busy 是簇内最忙核占用。
+                // 若 perf 长期贴 1.0 而 busy 不高 → 说明 headroom/门槛没起作用; 若 perf 恒定不动
+                // → 说明撞上了死区或 FSM 预算(闭环只能在预算内收紧)。
+                if (fsmDue && Config::AutoMode::loadgov_enable) {
+                    logger.Debug("负载闭环: 小核 busy=%d%% perf=%.3f 上限=%dMHz | 大核 busy=%d%% perf=%.3f 上限=%dMHz",
+                                 mx.clusterBusy[0], loadGovPrimed_[0] ? loadGov_[0].currentPerf : -1.0f,
+                                 caps.maxL / 1000,
+                                 mx.clusterBusy[1], loadGovPrimed_[1] ? loadGov_[1].currentPerf : -1.0f,
+                                 caps.maxB / 1000);
                 }
 
                 // ── FAS(帧感知): 仅【命中游戏画像(inGaming=gameHint) + 亮屏 + 开关 + 帧源可用】时闭环覆盖 scaling_max ──
@@ -2083,17 +2138,23 @@ public:
                 } else {
                     dnd_.release();
                 }
-                autoMode_.writeFsmStatus(mx, alpha, autoFsm_.stateName(),
+                if (fsmDue) autoMode_.writeFsmStatus(mx, alpha, autoFsm_.stateName(),
                                          capsToWrite.maxL / 1000, capsToWrite.maxB / 1000,
                                          policyResolver.result(), fasEngaged, fengchiActive);
                 // 自适应 tick(省唤醒): 息屏 30s; FAS 接管/预热期按 FAS 轮询节奏(200ms 闭环,
                 // measured_fps ~1s 窗口, 5Hz 足够; 预热若 8s 没接管则 warmingUp 放弃快节奏);
-                // 亮屏静态轻载(LIGHT_IDLE)放慢到 4s; 中载及以上 2s。前台一变仍由 wakeFsm 立即叫醒。
+                // 亮屏其余情形: 负载闭环开启时用 loadgov_tick_ms(缺省 600ms), 否则回旧口径
+                // (LIGHT_IDLE 4s / 中载及以上 2s)。前台一变仍由 wakeFsm 立即叫醒。
+                //
+                // 【为什么 LIGHT_IDLE 也跑快拍】轻载正是闭环最该把上限压下来的时段 —— 原来 4s
+                // 一拍意味着静止时上限 4 秒才可能变一次, 对负载完全没有反馈。代价是唤醒次数上升,
+                // 故负载闭环只读已在缓存 fd 上的 /proc/stat(见 AutoMode::readWeightedBusy), 无 popen。
                 int ivMs;
                 if (mx.screenOn == 0)                              ivMs = 30000;
                 else if (fasEngaged)                              ivMs = autoFas_.pollIntervalMs();
                 else if (fasWasGaming && autoFas_.warmingUp((long)nowMs()))
                                                                   ivMs = autoFas_.pollIntervalMs();
+                else if (tickCfg.loadGovEnable)                    ivMs = tickCfg.loadGovTickMs;
                 else if (autoFsm_.state() == AutoFsm::LIGHT_IDLE) ivMs = 4000;
                 else                                              ivMs = kFsmTickMs;
                 // ── Quiet Night(ASB V61): 夜间 + 息屏 + 未充电 → 大幅拉长 tick 让设备深睡 ──
@@ -2141,6 +2202,76 @@ public:
         int v = utils.readInt(p);
         if (v > 0) clusterHwMinKHz_[i] = v;
         return clusterHwMinKHz_[i] > 0 ? clusterHwMinKHz_[i] : 300000;
+    }
+
+    // ── 负载闭环调频（P0-2 / P0-3）────────────────────────────────────────────
+    // 把 config.json 的 loadgov_* 整数百分比同步进 LoadGovParams（配置热重载即时生效）。
+    // 每次调用都重建一次（纯值类型，开销可忽略），避免缓存一份可能过期的参数。
+    void syncLoadGovParams() {
+        kin::LoadGovParams p;
+        p.upThreshold       = (float)Config::AutoMode::loadgov_up_pct / 100.0f;
+        p.downThreshold     = (float)Config::AutoMode::loadgov_down_pct / 100.0f;
+        p.headroomFactor    = (float)Config::AutoMode::loadgov_headroom_pct / 100.0f;
+        p.smoothingUp       = (float)Config::AutoMode::loadgov_smooth_up_pct / 100.0f;
+        p.writeDeadzone     = (float)Config::AutoMode::loadgov_deadzone_pct / 100.0f;
+        p.writeDwellMs      = Config::AutoMode::loadgov_dwell_ms;
+        p.normalize();   // 越界/NaN 自愈（config 层已就地校验过一次，这里是第二道闸）
+        loadGovParams_ = p;
+    }
+
+    // 复位闭环状态：下次 tick 从“当前 FSM 预算”起步。
+    // 调用时机 = 进/退 auto、息屏→亮屏沿、配置重载 —— 这些时刻预算可能整体跳变，
+    // 带着旧的 currentPerf 跑会把新预算当成“负载变化”去追（ChiRi 的同款教训：
+    // reload_config 必须重放 perf_init，否则接管间隙 currentPerf 会掉到底再慢慢爬）。
+    void resetLoadGovernor() {
+        for (int i = 0; i < 2; ++i) {
+            loadGovPrimed_[i]      = false;
+            loadGovLastWriteMs_[i] = 0;
+        }
+    }
+
+    // 在 FSM 预算内按本簇负载收紧 caps.maxL/maxB。
+    // 调用位置：computeCaps + 用户 fsm_policy 覆盖之后、FAS/类别/热等后续 cap 之前 ——
+    // 保证“预算 -> 闭环收紧 -> 各方硬限制”的顺序（后续每一层仍可继续收紧）。
+    //
+    // 语义：**只能收紧**。闭环输出与预算取 min，永不抬高；因此关闭本层即逐位回退到原行为。
+    void applyLoadGovernor(AutoFsm::Caps& caps, const int clusterBusy[], long long nowMs) {
+        if (!Config::AutoMode::loadgov_enable) return;
+        syncLoadGovParams();
+
+        const int hwMax[2] = { autoFsm_.hwMaxL(), autoFsm_.hwMaxB() };
+        const int hwMin[2] = { autoFsm_.hwMinL(), autoFsm_.hwMinB() };
+        int*      budget[2] = { &caps.maxL, &caps.maxB };
+
+        for (int i = 0; i < 2; ++i) {
+            if (hwMax[i] <= 0) continue;          // 未探到硬件频率 -> 本簇不接管
+            const int busy = clusterBusy[i];
+            if (busy < 0) continue;               // 本拍读不到逐核负载 -> 保持原预算，不猜
+
+            // 驻留门（缺省 0 = 关）：未满驻留就整簇冻结，不调 step()。
+            // 不能“step 完再丢写入” —— 那会让状态机与 sysfs 失步，下一拍以新状态去追旧值。
+            if (!kin::dwellElapsed(nowMs, loadGovLastWriteMs_[i], loadGovParams_.writeDwellMs)) continue;
+
+            // 首次：从当前预算起步（而不是从固定的 perfInit），否则第一拍会把预算当成跳变。
+            if (!loadGovPrimed_[i]) {
+                float initPerf = (float)*budget[i] / (float)hwMax[i];
+                if (initPerf > 1.0f) initPerf = 1.0f;
+                loadGov_[i].reset(initPerf);
+                loadGovPrimed_[i] = true;
+            }
+
+            const float util = (float)busy / 100.0f;
+            const kin::GovStep st = kin::step(loadGov_[i], loadGovParams_, util);
+
+            // 写频计数：仅真实 Up/Down 才刷新驻留时钟（Hold / 等待确认不算一次写）。
+            if (st.decision == kin::GovDecision::Up || st.decision == kin::GovDecision::Down)
+                loadGovLastWriteMs_[i] = nowMs;
+
+            int khz = (int)(st.effPerf * (float)hwMax[i]);
+            if (khz < hwMin[i]) khz = hwMin[i];
+            // 只能收紧：闭环永远不会把预算抬高（“抬频买响应”应调升频门槛，不是拆这一层）
+            if (khz < *budget[i]) *budget[i] = khz;
+        }
     }
 
     // FSM 直接写各簇频率上限(小核=cluster0, 大核=cluster1, 超大核=cluster2+)。governor 沿用已预置

@@ -297,6 +297,10 @@ public:
         AutoMode::low_batt = 20; AutoMode::crit_batt = 10;
         AutoMode::night_start = 23; AutoMode::night_end = 6;
         AutoMode::tick_sec = 2; AutoMode::learn_rate = 80; AutoMode::drain_high = 14;
+        AutoMode::loadgov_enable = true; AutoMode::loadgov_tick_ms = 600;
+        AutoMode::loadgov_up_pct = 88; AutoMode::loadgov_down_pct = 62;
+        AutoMode::loadgov_headroom_pct = 120; AutoMode::loadgov_smooth_up_pct = 60;
+        AutoMode::loadgov_deadzone_pct = 3; AutoMode::loadgov_dwell_ms = 0;
         AutoMode::cool_lean = ""; AutoMode::battery_bias = 0;
         AutoMode::dt_vhot = 80; AutoMode::dt_hot = 40; AutoMode::dt_drainy = 30;
         AutoMode::dt_sustained = 20; AutoMode::dt_thermal_hit = 100; AutoMode::dt_clean_cool = -60;
@@ -664,6 +668,34 @@ private:
                 readInt (a, "night_start", AutoMode::night_start);
                 readInt (a, "night_end",   AutoMode::night_end);
                 readInt (a, "tick_sec",    AutoMode::tick_sec);
+                // ── 负载闭环调频(越界回缺省, 与 battery_bias 同款就地校验) ──
+                readBool(a, "loadgov_enable", AutoMode::loadgov_enable);
+                readInt (a, "loadgov_tick_ms", AutoMode::loadgov_tick_ms);
+                if (AutoMode::loadgov_tick_ms < 200 || AutoMode::loadgov_tick_ms > 2000) {
+                    logger.Warn("AutoMode: loadgov_tick_ms(%d) 越界[200,2000], 回退 600",
+                                AutoMode::loadgov_tick_ms);
+                    AutoMode::loadgov_tick_ms = 600;
+                }
+                readInt (a, "loadgov_up_pct", AutoMode::loadgov_up_pct);
+                readInt (a, "loadgov_down_pct", AutoMode::loadgov_down_pct);
+                readInt (a, "loadgov_headroom_pct", AutoMode::loadgov_headroom_pct);
+                readInt (a, "loadgov_smooth_up_pct", AutoMode::loadgov_smooth_up_pct);
+                readInt (a, "loadgov_deadzone_pct", AutoMode::loadgov_deadzone_pct);
+                readInt (a, "loadgov_dwell_ms", AutoMode::loadgov_dwell_ms);
+                // 门槛类一律钳进 (0,100), 且强制 down < up: 否则"滞回带"宽度为 0 或负,
+                // 升频减速公式失去意义(LoadGovernor::normalize 还会再兜一层, 这里提前给可见告警)。
+                if (AutoMode::loadgov_up_pct   < 10 || AutoMode::loadgov_up_pct   > 100) AutoMode::loadgov_up_pct   = 88;
+                if (AutoMode::loadgov_down_pct < 0  || AutoMode::loadgov_down_pct > 99)  AutoMode::loadgov_down_pct = 62;
+                if (AutoMode::loadgov_down_pct >= AutoMode::loadgov_up_pct)
+                    AutoMode::loadgov_down_pct = AutoMode::loadgov_up_pct - 1;
+                if (AutoMode::loadgov_headroom_pct < 100 || AutoMode::loadgov_headroom_pct > 200)
+                    AutoMode::loadgov_headroom_pct = 120;
+                if (AutoMode::loadgov_smooth_up_pct < 1 || AutoMode::loadgov_smooth_up_pct > 100)
+                    AutoMode::loadgov_smooth_up_pct = 60;
+                if (AutoMode::loadgov_deadzone_pct < 0 || AutoMode::loadgov_deadzone_pct > 20)
+                    AutoMode::loadgov_deadzone_pct = 3;
+                if (AutoMode::loadgov_dwell_ms < 0 || AutoMode::loadgov_dwell_ms > 5000)
+                    AutoMode::loadgov_dwell_ms = 0;
                 readInt (a, "learn_rate",  AutoMode::learn_rate);
                 readInt (a, "drain_high",  AutoMode::drain_high);
                 readStr (a, "cool_lean",   AutoMode::cool_lean);

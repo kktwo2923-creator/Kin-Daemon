@@ -53,6 +53,9 @@ public:
         float load1   = 0;    // /proc/loadavg 1 分钟负载(安卓含 I/O 等待 D 态, 偏高)
         int  cpuBusy  = -1;   // CPU 真实活跃%(/proc/stat, 排除 idle+iowait), -1=未知; 用作 load 闸门
         int  cpuBusyW = -1;   // 能效加权整机负载%(uperf 式: 按 cpu_capacity×当前频率 加权); -1=未知
+        // 每簇最忙核 busy%(0..100, -1=读不到)。负载闭环调频(LoadGovernor)的输入:
+        // 取簇内 max 而非均值 —— 1 线程跑在 6 核簇上是「1 核忙 5 核闲」, 均值会误判成轻载。
+        int  clusterBusy[4] = { -1, -1, -1, -1 };
         int  cpuPsi   = -1;   // PSI cpu some avg10(%): 任务因 CPU 争用等待的时间比; -1=无 PSI
         int  adpfHr   = -1;   // ADPF 热余量%(0=凉快 100=即将节流, App 经 getThermalHeadroom 推送); -1=无
         int  currentMa = -1;  // 电池放电电流(mA, 绝对值), -1=未知; 移植 ASB 电流佐证(真在干活才升档)
@@ -183,6 +186,7 @@ public:
         m.load1    = readLoad1();
         m.cpuBusy  = readCpuBusy();
         m.cpuBusyW = readWeightedBusy();
+        for (int i = 0; i < Config::kClusterCount; ++i) m.clusterBusy[i] = wClBusy_[i];
         m.cpuPsi   = readPsiCpu();
         m.adpfHr   = readAdpfHeadroom();
         m.currentMa = readBatteryCurrentMa();
@@ -1619,6 +1623,9 @@ private:
     // 用 cluster 最高频当能效系数(仍捕捉"大核权重高")。任一环缺失 → 返回 -1(调用方回退平均 cpuBusy)。
     bool  wProbed_ = false;
     int   wClOfCore_[8]  = { -1,-1,-1,-1,-1,-1,-1,-1 };  // core→cluster idx(0..3)
+    // 每簇最忙核 busy%(0..100, -1=本拍读不到); 由 readWeightedBusy 的逐核增量顺带算出。
+    // 负载闭环调频(LoadGovernor)的唯一输入 —— 不新增采样、不新增 fd。
+    int   wClBusy_[4]    = { -1,-1,-1,-1 };
     long  wCapCore_[8]   = {0};                          // 各核能效系数(cpu_capacity 或频率回退)
     int   wPolicyCl_[Config::kClusterCount] = { -1,-1,-1,-1 };
     long  wMaxFCl_[Config::kClusterCount]   = {0};
@@ -1719,6 +1726,20 @@ private:
             den += (long long)wCapCore_[c];
         }
         if (den <= 0) return -1;
+
+        // ── 顺带算出每簇**最忙核**的 busy%（负载闭环调频的输入）──
+        // 复用本次 /proc/stat 逐核增量, 不新增任何采样。
+        // 取簇内 max 而非均值: 调度器搬的是线程 —— 1 线程跑在 6 核簇上是「1 核忙、5 核闲」,
+        // 均值会把这种场景抹成 ~17% 而误判为轻载（ChiRi 旧版「需求桶」就是死于这类"整簇满载"假设）。
+        // 频率域是簇内共享的, 只要有一颗核打满, 整簇就得抬频。
+        for (int i = 0; i < Config::kClusterCount; ++i) wClBusy_[i] = -1;
+        for (int c = 0; c < 8; ++c) {
+            const int cl = wClOfCore_[c];
+            if (cl < 0 || cl >= Config::kClusterCount || !haveC[c]) continue;
+            const int pct = busyC[c] < 0 ? 0 : (busyC[c] > 100 ? 100 : (int)busyC[c]);
+            if (pct > wClBusy_[cl]) wClBusy_[cl] = pct;
+        }
+
         long long pct = num / den;   // busy_c 已是 0-100 → 结果自然 0-100
         return pct < 0 ? 0 : (pct > 100 ? 100 : (int)pct);
     }

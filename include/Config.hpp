@@ -87,6 +87,21 @@ namespace Config {
         inline int      night_start = 23;     // 夜间窗口起始小时(对齐 ASB night_quiet_hour_start=23)
         inline int      night_end   = 6;      // 夜间窗口结束小时(ASB NIGHT_HOUR_END=6)
         inline int      tick_sec    = 2;      // 决策周期(秒, 亮屏, 默认2同ASB); 息屏自动放宽
+
+        // ── 负载闭环调频(P0-2/P0-3, 移植 ChiRi CLG 决策内核; 算法见 include/LoadGovernor.hpp) ──
+        // 智能档原来只写静态频率界: AutoFsm 每 tick 选一个状态, 状态映射到静态界表, 状态不变则
+        // scaling_max 恒定 —— 对负载没有任何反馈。开启后每 loadgov_tick_ms 用**本簇逐核 busy%**
+        // 算一次期望上限, 作为「只能收紧」的一层叠在 FSM 预算之内(取 min, 永不突破预算)。
+        // 缺省值 = ChiRi 在 SM8550 真机调过的那一组(up 0.88 / down 0.62 / headroom 1.20 /
+        // smoothing_up 0.60 / deadzone 0.03)。
+        inline bool     loadgov_enable      = true;
+        inline int      loadgov_tick_ms     = 600;  // 闭环周期(ms, 200..2000); 600 = ChiRi 160ms 的保守版
+        inline int      loadgov_up_pct      = 88;   // 升频门槛(%)
+        inline int      loadgov_down_pct    = 62;   // 降频门槛(%)
+        inline int      loadgov_headroom_pct= 120;  // 性能余量(%, >=100)
+        inline int      loadgov_smooth_up_pct = 60; // 升频步长(%)
+        inline int      loadgov_deadzone_pct= 3;    // 写频死区(簇硬件最高频的 %)
+        inline int      loadgov_dwell_ms    = 0;    // 写频最小驻留(ms, 0=关); 确认窗口已提供 1.8s/1.2s 驻留
         inline int      learn_rate  = 80;     // 学习率(/1000): dt_alpha×此值/1000(ASB LEARN_RATE_X1000=80)
         inline int      drain_high  = 14;     // 亮屏掉电率(%/h) ≥ 此值视为高耗电(学习 +30)
         inline string_t cool_lean;            // 凉爽且低 alpha 时偏好: "performance"=可冲高; 空/其它=最高 balance

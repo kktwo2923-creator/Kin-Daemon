@@ -59,7 +59,8 @@ void testDefaults() {
     approx(p.writeDeadzone,      0.03f, 1e-6f, "default writeDeadzone");
     eqi(p.upRateLimitTicks,   3, "default upRateLimitTicks");
     eqi(p.downRateLimitTicks, 2, "default downRateLimitTicks");
-    eqi(p.writeDwellMs,     800, "default writeDwellMs");
+    // Kin 缺省关闭驻留：确认窗口(up 3/down 2 tick @600ms)已提供 1.8s/1.2s 驻留
+    eqi(p.writeDwellMs,       0, "default writeDwellMs (disabled, see header)");
 
     // R2：天花板恒 1.0，不许当省电旋钮
     approx(p.perfCeil, 1.0f, 1e-6f, "default perfCeil must stay 1.0 (R2)");

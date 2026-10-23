@@ -4,6 +4,84 @@
 
 未最终完成。工作仓库为 `E:\项目文件\Kin\Kin-Daemon`；保留现有未提交改动，不用 reset/checkout 清理。不要将 Windows 测试通过等同于 Android 实机验证。
 
+## 本轮：负载闭环调频（P0-2 / P0-3，移植 ChiRi CLG 决策内核）
+
+分支 `p0/release-scaling-min`。参考项目：ChiRi 千漓调度（`github.com/Aibeto/ChiRiScene`）。
+
+### 先纠正一个错误结论（避免以后重提）
+
+计划里原本把「释放 scaling_min」列为第一优先级，依据是 `AutoFsm::Caps` 有 `minL/minB` 字段。
+**核查后发现 Kin 早就做到了**：`writeFsmCaps` 传空下限（`FreqWriter(pol, string_t(), bmx, gov)`，
+注释写明「空下限 = 不写 scaling_min」），auto 模式入口 `applyCurrentMode` 不走 `applyWithProfile`
+而是 `primeAutoFsm()`，后者显式把 min 写成 `0`（hw-min）。所以这一条**无需改动**。
+遗留的小问题：auto 路径上 `capsToWrite.minL/minB` 是死值（算出来、经 PolicyResolver 搬运、
+最终不落盘），读代码时容易误以为 min 在受控。未改（不落盘是设计），仅记录。
+
+### 真正缺的是闭环
+
+`computeCaps` 是 `state + alpha` 的纯函数，状态不变则 caps 恒定 —— **2 秒 tick 内 scaling_max
+是个常数，对负载没有任何反馈**。这才是"开环"的确切含义。
+
+### 已落地（两个提交）
+
+**提交 1 `faa4cd9`：算法层（纯函数，未接线）**
+- 新增 `include/LoadGovernor.hpp`：EMA 平滑 / 尖峰抑制 / headroom 过渡带 / 双向死区 /
+  升降频确认 tick / 极低负载立即降频 / 滞回带慢升 / normalize 自愈。零 IO，主机可测。
+- 缺省参数 = ChiRi 在 SM8550 真机调过的那一组。
+- 新增 `tests/test_load_governor.cpp`（CTest `kin_load_governor`），14 组用例。
+- 变异验证 5 项全部被捕获：死区 gate 单侧化 / 去掉首 tick 豁免 / fastDown 判据 `<=`→`<` /
+  升频窗口 off-by-one / `perfCeil` 默认改 0.80。
+- **测试抓到一个真 bug**：首 tick 没有历史却套用了尖峰抑制（`lastUtil=0`，刚接管遇高负载
+  被判成巨大跳升 → 抑制到 0.14 → 比 `perfInit=0.45` 还低 → 决策成了**降频**）。修法 = 首 tick
+  豁免尖峰抑制（没有历史就没有尖峰可言），并加 `testFirstTickNoSuppression` 锁死。
+
+**提交 2：接线（方案 A = 缩短 FSM tick + 闭环作为"只能收紧"的一层）**
+- `AutoMode::Metrics` 新增 `clusterBusy[4]`（每簇**最忙核** busy%，-1=读不到），由
+  `readWeightedBusy` 的逐核 `/proc/stat` 增量顺带算出 —— **不新增采样、不新增 fd**。
+  取簇内 max 而非均值：1 线程跑在 6 核簇上是「1 核忙 5 核闲」，均值会抹成 ~17% 误判成轻载。
+- `scheduler.hpp`：`applyLoadGovernor()` 插在 **用户 fsm_policy 覆盖之后、FAS/类别/热之前**。
+  fsm_policy 是用户配的**预算**，闭环只能在预算内收紧；后续每一层仍可继续取 min。
+  闭环输出与预算取 `min`，**永不抬高** → 关掉即逐位回退。
+- 首次从"当前预算"起步（`loadGovPrimed_`），不从固定 `perfInit`，否则第一拍会把预算当跳变。
+- 复位点：退出 auto、息屏→亮屏沿（否则带着 DEEP_IDLE 时的低 currentPerf 醒来，要爬好几拍）。
+- 配置：`loadgov_enable` / `loadgov_tick_ms`(600) / `loadgov_up_pct` / `loadgov_down_pct` /
+  `loadgov_headroom_pct` / `loadgov_smooth_up_pct` / `loadgov_deadzone_pct` / `loadgov_dwell_ms`。
+
+### 关键设计：FSM 节奏与闭环解耦（否则会引入新 bug）
+
+`AutoFsm` 的确认窗口是**按 tick 数**标定的：`UP_WINDOW=2`（注释口径 ×2s=4s）、
+`DOWN_WINDOW=5`（×2s=10s）、`kPairConfirmWindow=3`。tick 缩到 600ms 后若仍每拍推进状态机，
+等价于把升档压到 1.2s、降档压到 3s —— 状态机会明显 churn（上游现场日志已证 MODERATE↔HEAVY
+来回本身就是主要抖动源）。故新增 `fsmDue` 抽帧：**状态机 + 会话记账 + status 文件仍按
+`kFsmTickMs`(2s)，只有采样 + 闭环 + 写频跑 600ms 快拍**。最小驻留是墙钟秒，不受影响。
+
+### 未验证 / 不能吹的
+
+- **未在真机跑过**。Windows 主机 CTest 23/23 通过（排除 3 项既有失败：`kin_node_writer` /
+  `kin_node_value` 超时、`kin_gamelist` 读不到文件 —— 已用 `git stash` 在干净树上复跑确认
+  同样失败，与本改动无关）；Android arm64 编译链接通过（8 个既有 shadow 警告，无新增）。
+- **tick 从 2s 降到 600ms 的实际功耗影响未测**。ChiRi 的教训是"有副作用的读不能挂高频采样"
+  （每秒读 Adreno gpuclk 会让 playback 从 1.76W 涨到 2.59W）。已核过 `AutoMode::sample()`
+  全是缓存 fd 上的 `pread`、无 popen，但**没有实测唤醒数与功耗**。
+- **闭环收益（省多少电、掉帧有没有变差）未测**。可观测口径已加：Debug 日志每 FSM 拍打一行
+  「负载闭环: 小核 busy=?% perf=? 上限=?MHz | 大核 ...」。判读：perf 长期贴 1.0 而 busy 不高
+  → headroom/门槛没起作用；perf 恒定不动 → 撞上死区或 FSM 预算。
+- `loadgov_dwell_ms` 缺省 **0（关闭）**：Kin 的确认窗口（up 3 tick / down 2 tick @600ms
+  = 1.8s/1.2s）本身已是驻留，再加一层会把周期翻倍并让状态机与 sysfs 失步。
+
+### 回退
+
+- `loadgov_enable: false` → 逐位回到原行为（闭环只读不写，且 tick 回旧口径 4s/2s）。
+- 单项调参：`loadgov_up_pct`（升频门槛，调高更省电/更不跟手）、`loadgov_smooth_up_pct`
+  （升频步长）、`loadgov_deadzone_pct`（写频死区）。
+- 整层回退 = 删 `applyLoadGovernor` 调用 + `LoadGovernor.hpp`（提交 2 的 diff 是独立的）。
+
+### 下一步
+
+1. 真机长时观察：Debug 日志的 perf/busy 关系、`WriteStatusTracker` 的写频次数/分钟。
+2. 若功耗反升 → 先查 `loadgov_tick_ms` 从 600 放到 1000，再查 `sample()` 里哪一项有副作用。
+3. 之后才是 P1-1（FAS 逐帧 + jank + loading）、P1-2（稳态下探 T11）、P2-1（帕累托甜点封顶）。
+
 ## 最新一轮：恢复路径审计 + 修两个真实缺陷
 
 处理交接清单 item 4（“退出恢复可能清空 held 标记，需故障注入验证；uclamp 单位需分别核对”）。

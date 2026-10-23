@@ -76,8 +76,11 @@ struct LoadGovParams {
 
     // 写频死区（× 性能比，等价于 × 簇硬件最高频的占比）
     float writeDeadzone      = 0.03f;
-    // 写频最小驻留（ms）。Kin 400ms tick 时取 800 = 2 tick。
-    int   writeDwellMs       = 800;
+    // 写频最小驻留（ms）。0 = 关闭。
+    // ChiRi 取 320ms = 2 × 它 160ms 的负载采样周期。Kin 的 tick 是 600ms，而升/降频确认窗口
+    // （up 3 tick / down 2 tick）本身已经是 1.8s / 1.2s 的驻留，再加一层只会把周期翻倍并让
+    // 状态机与 sysfs 失步，故**缺省关闭**；需要更细的写频节流时再开（建议 >= 1 个 tick）。
+    int   writeDwellMs       = 0;
 
     // 钳位与自愈：任何越界/NaN 回缺省，不把非法值带进决策。
     void normalize();
