@@ -164,6 +164,10 @@ if(BUILD_TESTING AND NOT ANDROID)
     target_include_directories(kin_test_probe_cadence PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_probe_cadence COMMAND kin_test_probe_cadence)
 
+    add_executable(kin_test_load_governor tests/test_load_governor.cpp)
+    target_include_directories(kin_test_load_governor PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_load_governor COMMAND kin_test_load_governor)
+
     add_executable(kin_test_idle_uclamp tests/test_idle_uclamp.cpp)
     target_include_directories(kin_test_idle_uclamp PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_idle_uclamp COMMAND kin_test_idle_uclamp)
