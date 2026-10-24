@@ -35,11 +35,14 @@ bool decisionIs(kin::GovDecision got, kin::GovDecision want, const char* what) {
     return false;
 }
 
-// 测试用参数：关掉 EMA 与尖峰抑制，让 util 直达决策，便于逐 tick 断言。
+// 测试用参数：关掉 EMA / 尖峰抑制 / 稳态下探，让 util 直达决策，便于逐 tick 断言。
+// 稳态下探必须一起关 —— 它会在稳态下改变 effPerf（这正是它的设计目的），
+// 否则"稳态保持 perf 不变"这类断言会失败。T11 有专门的用例。
 kin::LoadGovParams plainParams() {
     kin::LoadGovParams p;
-    p.utilSmoothing      = 1.0f;    // 关 EMA
-    p.spikeJumpThreshold = 1.0f;    // 关尖峰抑制
+    p.utilSmoothing        = 1.0f;    // 关 EMA
+    p.spikeJumpThreshold   = 1.0f;    // 关尖峰抑制
+    p.steadyDecayEnabled   = false;   // 关稳态下探
     p.normalize();
     return p;
 }
@@ -64,6 +67,14 @@ void testDefaults() {
 
     // R2：天花板恒 1.0，不许当省电旋钮
     approx(p.perfCeil, 1.0f, 1e-6f, "default perfCeil must stay 1.0 (R2)");
+
+    // T11 稳态下探（ChiRi 缺省值）
+    if (!p.steadyDecayEnabled) { std::printf("FAIL steady decay should default on\n"); g_fail = 1; }
+    approx(p.steadyDecayTargetRatio, 0.90f, 1e-6f, "default steadyDecayTargetRatio");
+    approx(p.steadyDecayBand,        0.02f, 1e-6f, "default steadyDecayBand");
+    approx(p.steadyDecayStep,        0.01f, 1e-6f, "default steadyDecayStep");
+    approx(p.steadyDecayMax,         0.25f, 1e-6f, "default steadyDecayMax");
+    eqi(p.steadyDecayStableTicks, 12, "default steadyDecayStableTicks");
 }
 
 // ── 2. 死区 gate 双向对称（护栏 1：本文件最重要的一条）────────────────────
@@ -435,6 +446,172 @@ void testResponsiveness() {
     }
 }
 
+// ── 15. 稳态下探 T11：积分推进 / 清零 / 不回写 / 死区量化 / 自限性 ──
+// 注意：第 1 个 tick 的 utilDelta = util − 0 会被当成"负载上行"，所以有效稳定从第 2 个 tick 算起。
+kin::GovStep runTicks(kin::LoadGovState& s, const kin::LoadGovParams& p, float util, int n) {
+    kin::GovStep last{};
+    for (int i = 0; i < n; ++i) last = kin::step(s, p, util);
+    return last;
+}
+
+// 给 state 预置"已有历史"，避开首 tick 被当成负载上行
+void primeHistory(kin::LoadGovState& s, float util) { s.lastUtil = util; s.emaUtil = util; }
+
+void testSteadyDecayNotBeforeStable() {
+    kin::LoadGovParams p = plainParams();
+    p.steadyDecayEnabled     = true;
+    p.steadyDecayStableTicks = 12;
+    kin::LoadGovState s;
+    s.reset(0.50f);
+    primeHistory(s, 0.50f);
+    // util 0.50 < T−band（0.88×0.90−0.02 = 0.772），本应下探；但 streak 未满 → 不得动
+    runTicks(s, p, 0.50f, 11);
+    approx(s.steadyDecay, 0.0f, 1e-6f, "no decay before stableTicks");
+    runTicks(s, p, 0.50f, 1);
+    if (!(s.steadyDecay > 0.0f)) {
+        std::printf("FAIL decay should start at stableTicks (got %.4f)\n", s.steadyDecay);
+        g_fail = 1;
+    }
+}
+
+void testSteadyDecayDeepens() {
+    kin::LoadGovParams p = plainParams();
+    p.steadyDecayEnabled     = true;
+    p.steadyDecayStableTicks = 2;
+    p.steadyDecayStep        = 0.01f;
+    p.steadyDecayMax         = 0.25f;
+    kin::LoadGovState s;
+    s.reset(0.50f);
+    primeHistory(s, 0.50f);
+    // 计数口径：streak 达到 stableTicks 的**那一拍**就开始积分（不是下一拍）
+    runTicks(s, p, 0.50f, 1);
+    approx(s.steadyDecay, 0.0f, 1e-6f, "tick 1: streak 1/2, no step yet");
+    runTicks(s, p, 0.50f, 1);
+    approx(s.steadyDecay, 0.01f, 1e-6f, "tick 2: streak reaches stableTicks, first step");
+    runTicks(s, p, 0.50f, 4);
+    approx(s.steadyDecay, 0.05f, 1e-6f, "6 ticks total -> 5 steps of 0.01");
+    runTicks(s, p, 0.50f, 100);    // 幅值上限
+    approx(s.steadyDecay, p.steadyDecayMax, 1e-5f, "decay clamped at steadyDecayMax");
+}
+
+void testSteadyDecayClearsOnLoadRise() {
+    kin::LoadGovParams p = plainParams();
+    p.steadyDecayEnabled     = true;
+    p.steadyDecayStableTicks = 2;
+    kin::LoadGovState s;
+    s.reset(0.50f);
+    primeHistory(s, 0.50f);
+    runTicks(s, p, 0.50f, 8);
+    if (!(s.steadyDecay > 0.0f)) { std::printf("FAIL precondition: no decay\n"); g_fail = 1; return; }
+    // 负载上行超过 band（0.02）→ 立即清零，不等积分慢慢退
+    kin::step(s, p, 0.70f);
+    approx(s.steadyDecay, 0.0f, 1e-6f, "load rise clears decay immediately");
+    eqi(s.steadyStreak, 0, "load rise resets streak");
+}
+
+void testSteadyDecayClearsAtUpThreshold() {
+    kin::LoadGovParams p = plainParams();
+    p.steadyDecayEnabled     = true;
+    p.steadyDecayStableTicks = 2;
+    kin::LoadGovState s;
+    s.reset(0.50f);
+    primeHistory(s, 0.50f);
+    runTicks(s, p, 0.50f, 8);
+    if (!(s.steadyDecay > 0.0f)) { std::printf("FAIL precondition: no decay\n"); g_fail = 1; return; }
+    kin::step(s, p, 0.95f);
+    approx(s.steadyDecay, 0.0f, 1e-6f, "up-threshold clears decay");
+}
+
+void testSteadyDecayClearsAtLowLoad() {
+    kin::LoadGovParams p = plainParams();
+    p.steadyDecayEnabled     = true;
+    p.steadyDecayStableTicks = 2;
+    kin::LoadGovState s;
+    s.reset(0.50f);
+    primeHistory(s, 0.50f);
+    runTicks(s, p, 0.50f, 8);
+    if (!(s.steadyDecay > 0.0f)) { std::printf("FAIL precondition: no decay\n"); g_fail = 1; return; }
+    kin::step(s, p, 0.10f);   // 极低负载：走正常降频路径，不需要下探偏移
+    approx(s.steadyDecay, 0.0f, 1e-6f, "low load clears decay");
+}
+
+// 最重要的一条：下探只能作用于**输出**，绝不能回写 currentPerf。
+// 回写会与升频分支的 `target > oldPerf` 比较打架 → 振荡。
+void testSteadyDecayNeverWritesBack() {
+    kin::LoadGovParams p = plainParams();
+    p.steadyDecayEnabled     = true;
+    p.steadyDecayStableTicks = 2;
+    kin::LoadGovState s;
+    s.reset(0.50f);
+    primeHistory(s, 0.50f);
+    runTicks(s, p, 0.50f, 3);
+    const float perfBefore  = s.currentPerf;
+    const float decayBefore = s.steadyDecay;
+    runTicks(s, p, 0.50f, 10);
+    if (!(s.steadyDecay > decayBefore)) { std::printf("FAIL precondition: decay did not grow\n"); g_fail = 1; return; }
+    approx(s.currentPerf, perfBefore, 1e-6f, "decay must NOT write back to currentPerf");
+}
+
+// 死区量化：积分步长 0.01 < 写频死区 0.03 时，输出不能每 tick 都变。
+// 否则"稳态"会变成 1.7 次/秒的写频（600ms tick）。
+void testSteadyDecayDeadzoneQuantized() {
+    kin::LoadGovParams p = plainParams();
+    p.steadyDecayEnabled     = true;
+    p.steadyDecayStableTicks = 2;
+    p.steadyDecayStep        = 0.01f;
+    p.writeDeadzone          = 0.03f;
+    kin::LoadGovState s;
+    s.reset(0.50f);
+    primeHistory(s, 0.50f);
+
+    float lastEff = -1.0f;
+    int changes = 0;
+    for (int i = 0; i < 20; ++i) {
+        const kin::GovStep r = kin::step(s, p, 0.50f);
+        if (lastEff >= 0.0f && (r.effPerf > lastEff + 1e-6f || r.effPerf < lastEff - 1e-6f)) ++changes;
+        lastEff = r.effPerf;
+    }
+    if (changes > 7) {
+        std::printf("FAIL effPerf changed %d times in 20 ticks (deadzone not quantizing)\n", changes);
+        g_fail = 1;
+    }
+    if (changes == 0) {
+        std::printf("FAIL effPerf never changed - decay not reaching output\n");
+        g_fail = 1;
+    }
+}
+
+void testSteadyDecayRespectsFloor() {
+    kin::LoadGovParams p = plainParams();
+    p.steadyDecayEnabled     = true;
+    p.steadyDecayStableTicks = 1;
+    p.steadyDecayMax         = 0.9f;    // 故意放大，看钳制
+    p.perfFloor              = 0.30f;
+    kin::LoadGovState s;
+    s.reset(0.35f);
+    primeHistory(s, 0.40f);
+    const kin::GovStep r = runTicks(s, p, 0.40f, 60);
+    if (!(r.effPerf >= p.perfFloor - 1e-6f)) {
+        std::printf("FAIL effPerf %.4f below floor %.4f\n", r.effPerf, p.perfFloor);
+        g_fail = 1;
+    }
+}
+
+// 自限性：压频后同一份工作占用更多墙钟时间 → util 抬高 → 触阈值自动清零。
+void testSteadyDecaySelfLimiting() {
+    kin::LoadGovParams p = plainParams();
+    p.steadyDecayEnabled     = true;
+    p.steadyDecayStableTicks = 2;
+    kin::LoadGovState s;
+    s.reset(0.50f);
+    primeHistory(s, 0.50f);
+    runTicks(s, p, 0.50f, 10);
+    if (!(s.steadyDecay > 0.0f)) { std::printf("FAIL precondition: no decay\n"); g_fail = 1; return; }
+    // 反馈：下探生效后 util 被抬高到升频门槛以上
+    kin::step(s, p, p.upThreshold);
+    approx(s.steadyDecay, 0.0f, 1e-6f, "self-limiting: raised util clears decay");
+}
+
 }  // namespace
 
 int main() {
@@ -453,6 +630,15 @@ int main() {
     testNormalize();
     testDwell();
     testResponsiveness();
+    testSteadyDecayNotBeforeStable();
+    testSteadyDecayDeepens();
+    testSteadyDecayClearsOnLoadRise();
+    testSteadyDecayClearsAtUpThreshold();
+    testSteadyDecayClearsAtLowLoad();
+    testSteadyDecayNeverWritesBack();
+    testSteadyDecayDeadzoneQuantized();
+    testSteadyDecayRespectsFloor();
+    testSteadyDecaySelfLimiting();
 
     if (g_fail) {
         std::puts("FAIL load governor: see above");
@@ -460,6 +646,6 @@ int main() {
     }
     std::puts("PASS load governor: defaults, deadzone symmetry, rate limits, fast-down, "
               "steady hold, EMA, spike, first-tick, monotonic, domain, slow-up, normalize, "
-              "dwell, responsiveness");
+              "dwell, responsiveness, steady-decay (gate/clear/no-writeback/quantize/floor/self-limit)");
     return 0;
 }

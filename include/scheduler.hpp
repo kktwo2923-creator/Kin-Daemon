@@ -2233,6 +2233,11 @@ public:
         p.smoothingUp       = (float)Config::AutoMode::loadgov_smooth_up_pct / 100.0f;
         p.writeDeadzone     = (float)Config::AutoMode::loadgov_deadzone_pct / 100.0f;
         p.writeDwellMs      = Config::AutoMode::loadgov_dwell_ms;
+        // T11 稳态下探
+        p.steadyDecayEnabled     = Config::AutoMode::loadgov_steady_enable;
+        p.steadyDecayTargetRatio = (float)Config::AutoMode::loadgov_steady_target_pct / 100.0f;
+        p.steadyDecayStep        = (float)Config::AutoMode::loadgov_steady_step_x1000 / 1000.0f;
+        p.steadyDecayMax         = (float)Config::AutoMode::loadgov_steady_max_pct / 100.0f;
         p.normalize();   // 越界/NaN 自愈（config 层已就地校验过一次，这里是第二道闸）
         loadGovParams_ = p;
     }

@@ -103,6 +103,15 @@ namespace Config {
         inline int      loadgov_deadzone_pct= 3;    // 写频死区(簇硬件最高频的 %)
         inline int      loadgov_dwell_ms    = 0;    // 写频最小驻留(ms, 0=关); 确认窗口已提供 1.8s/1.2s 驻留
 
+        // ── 稳态下探 T11(见 LoadGovernor.hpp 的 steadyDecay*) ──
+        // 稳态时对「写侧上限」做限幅积分下探：目标水位 T = up_threshold × target，
+        // util 低于 T-band 就慢慢加深、高于 T+band 就回收、负载上行立即清零。
+        // 这是「不封顶、靠门槛省电」的接棒机制 —— 拆掉天花板之后由它把稳态功耗压回来。
+        inline bool     loadgov_steady_enable      = true;
+        inline int      loadgov_steady_target_pct  = 90;   // T = up_threshold × 本值(%)
+        inline int      loadgov_steady_step_x1000  = 10;   // 每拍加深步长(千分比)
+        inline int      loadgov_steady_max_pct     = 25;   // 下探幅值上限(%), 抗积分饱和
+
         // ── FAS 帧级分析(P1-1, 见 include/FasFrames.hpp) ──
         // 读条/过图识别 + 加载后保护 + 升档驻留。逐帧数据来自 dumpsys --latency(免费),
         // 只有 measured_fps 的机型退化成窗口判定(帧率 < 目标 40% 且 GPU 闲)。

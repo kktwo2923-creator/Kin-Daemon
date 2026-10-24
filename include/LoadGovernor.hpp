@@ -74,6 +74,20 @@ struct LoadGovParams {
     int   upRateLimitTicks   = 3;
     int   downRateLimitTicks = 2;
 
+    // ── 稳态下探（T11）──────────────────────────────────────────────────────
+    // 语义：对「写侧性能偏移」的**限幅积分控制**，被控量是 util。
+    // 目标水位 T = upThreshold × steadyDecayTargetRatio；util 高于 T+band 就回收（步长 ×2 防过冲）、
+    // 低于 T−band 就加深、带内保持。偏移**只从输出里减去，绝不回写 currentPerf** ——
+    // 否则会与升频分支的 target > oldPerf 比较打架，产生振荡。
+    // 自限性来自「压频 → 同一份工作占用更多墙钟时间 → 真实 util 被抬高 → 触阈值即清零」。
+    // 为什么不做「稳态就无脑累加」：那会形成 2~4s 周期的频率锯齿，正是本层要防的东西。
+    bool  steadyDecayEnabled     = true;
+    float steadyDecayTargetRatio = 0.90f;   // T = upThreshold × 本值
+    float steadyDecayBand        = 0.02f;   // 稳定带 + T 的保持死区
+    int   steadyDecayStableTicks = 12;      // 连续稳定 tick 数满此值才开始积分
+    float steadyDecayStep        = 0.01f;   // 每次加深步长（回收 = ×2）
+    float steadyDecayMax         = 0.25f;   // 幅值上限（抗积分饱和）
+
     // 写频死区（× 性能比，等价于 × 簇硬件最高频的占比）
     float writeDeadzone      = 0.03f;
     // 写频最小驻留（ms）。0 = 关闭。
@@ -93,6 +107,12 @@ struct LoadGovState {
     float lastUtil    = 0.0f;    // 上一 tick 的平滑负载（供尖峰判定）
     int   upWait      = 0;       // 升频确认计数
     int   downWait    = 0;       // 降频确认计数
+    // [steady_decay] 下探量分两个：积分状态（内部，可每 tick 变）与已对外暴露值（死区量化）。
+    // 分开的原因见 emit 处注释：积分步长 0.01 小于写频死区 0.03，若直接暴露会每 tick 都产生
+    // 一次写频，把"稳态"变成高频写。
+    float steadyDecay        = 0.0f;
+    float steadyDecayApplied = 0.0f;
+    int   steadyStreak       = 0;
 
     // 接管/重建/模式切换时复位到新的初始上限
     void reset(float initPerf) {
@@ -101,6 +121,9 @@ struct LoadGovState {
         lastUtil = 0.0f;
         upWait = 0;
         downWait = 0;
+        steadyDecay = 0.0f;
+        steadyDecayApplied = 0.0f;
+        steadyStreak = 0;
     }
 };
 
@@ -142,10 +165,43 @@ inline GovStep step(LoadGovState& s, const LoadGovParams& p, float util) {
 
     // 2) 尖峰抑制：单 tick 跳升过大时只采纳 spikeDecay 比例的增量。
     //    lastUtil 记的是**平滑后**的值（与 ChiRi 一致），不是抑制后的值。
+    const float prevSmoothed = s.lastUtil;   // [steady_decay] 要用更新前的值算差量
     float u = smoothed;
     if (!firstTick && smoothed > s.lastUtil + p.spikeJumpThreshold)
         u = s.lastUtil + (smoothed - s.lastUtil) * p.spikeDecay;
     s.lastUtil = smoothed;
+
+    // 2b) [steady_decay] 稳态下探的积分推进。
+    //     被控量是 util，目标水位 T = upThreshold × targetRatio。
+    //     注意这里只推进**积分状态**，不参与本轮决策；输出侧在 emit 里做减法。
+    {
+        const float utilDelta = smoothed - prevSmoothed;
+        const bool stable = (utilDelta <= p.steadyDecayBand) && (utilDelta >= -p.steadyDecayBand);
+        if (!p.steadyDecayEnabled
+            || smoothed >= p.upThreshold          // 负载已到升频门槛：不做任何下探
+            || smoothed < p.downFastThreshold     // 极低负载：走正常降频路径即可
+            || utilDelta > p.steadyDecayBand) {   // 负载上行：立即放弃（安全方向）
+            s.steadyDecay = 0.0f;
+            s.steadyStreak = 0;
+        } else if (stable) {
+            if (s.steadyStreak < p.steadyDecayStableTicks) ++s.steadyStreak;
+            if (s.steadyStreak >= p.steadyDecayStableTicks) {
+                const float T = p.upThreshold * p.steadyDecayTargetRatio;
+                if (smoothed > T + p.steadyDecayBand) {
+                    // 回收步长 ×2 防过冲
+                    s.steadyDecay -= p.steadyDecayStep * 2.0f;
+                    if (s.steadyDecay < 0.0f) s.steadyDecay = 0.0f;
+                } else if (smoothed < T - p.steadyDecayBand) {
+                    s.steadyDecay += p.steadyDecayStep;
+                    if (s.steadyDecay > p.steadyDecayMax) s.steadyDecay = p.steadyDecayMax;
+                }
+                // 带内保持 → 消除抖动
+            }
+        } else {
+            // 抖动只清进度，**不清**已建立的下探量（噪声不得反复打回）
+            s.steadyStreak = 0;
+        }
+    }
 
     // 3) headroom：upThreshold 以上给满余量，ramp 带内线性过渡，带下恒 1.0
     const float rampStart = p.upThreshold - p.headroomRamp;
@@ -170,25 +226,43 @@ inline GovStep step(LoadGovState& s, const LoadGovParams& p, float util) {
     const float oldPerf = s.currentPerf;
     const float delta = target - oldPerf;
 
+    // [steady_decay] 写侧输出：currentPerf − 已暴露的下探量，钳到 [floor, ceil]。
+    // 三条护栏：
+    //   a) **绝不回写 currentPerf** —— 回写会与下面 `target > oldPerf` 的比较打架，形成振荡；
+    //   b) 下探量按**写频死区量化**后再暴露 —— 积分步长 0.01 < 死区 0.03 时，直接暴露会让
+    //      每个 tick 都产生一次写频，把"稳态"变成高频写；
+    //   c) 释放方向（回收/清零）**立即生效**，只有加深方向走量化 —— 安全方向不该被延迟。
+    auto emit = [&](GovDecision d) -> GovStep {
+        const float want = s.steadyDecay;
+        if (want <= 0.0f) {
+            s.steadyDecayApplied = 0.0f;                       // 清零立即生效
+        } else if (want > s.steadyDecayApplied + p.writeDeadzone) {
+            s.steadyDecayApplied = want;                       // 加深：够一个死区才暴露
+        } else if (want < s.steadyDecayApplied - p.writeDeadzone) {
+            s.steadyDecayApplied = want;                       // 回收：够一个死区才暴露
+        }
+        float eff = s.currentPerf - s.steadyDecayApplied;
+        if (!(eff >= p.perfFloor)) eff = p.perfFloor;
+        if (eff > p.perfCeil) eff = p.perfCeil;
+        out.decision = d;
+        out.effPerf = eff;
+        return out;
+    };
+
     // 5) 死区 gate —— 护栏 [1]：双向对称，且必须放在升/降分支之前。
     //    命中即 hold：不写频、不累加 up/down 计数、不翻转方向。
     //    这样"写不进 sysfs 的 no-op 意图"不会抹掉另一个方向的确认进度。
     const float absDelta = delta < 0.0f ? -delta : delta;
     if (absDelta <= p.writeDeadzone) {
-        out.decision = GovDecision::Hold;
-        out.effPerf = oldPerf;
-        return out;
+        return emit(GovDecision::Hold);
     }
 
     if (delta > 0.0f) {
         // ── 升频 ──
         s.downWait = 0;                     // 真实升频意图才清降频进度
         if (++s.upWait < p.upRateLimitTicks) {
-            out.decision = GovDecision::UpWait;
-            out.effPerf = oldPerf;
-            return out;
+            return emit(GovDecision::UpWait);
         }
-        out.decision = GovDecision::Up;
 
         // 抬 ceiling 不强制频率跳变：schedutil 在 [hw-min, ceiling] 内自主取频，
         // 所以这里只需平滑抬高上限，不需要读 scaling_cur_freq 做余量检查。
@@ -213,11 +287,8 @@ inline GovStep step(LoadGovState& s, const LoadGovParams& p, float util) {
         // 极低负载豁免确认期：util < downFastThreshold 时不等待
         const bool fastDown = u < p.downFastThreshold;
         if (!fastDown && ++s.downWait < p.downRateLimitTicks) {
-            out.decision = GovDecision::DownWait;
-            out.effPerf = oldPerf;
-            return out;
+            return emit(GovDecision::DownWait);
         }
-        out.decision = GovDecision::Down;
         // 一步到位降上限：降 ceiling 只收窄 schedutil 区间，不会把实际频率抬上去
         s.currentPerf = target;
     }
@@ -225,8 +296,7 @@ inline GovStep step(LoadGovState& s, const LoadGovParams& p, float util) {
     // 收尾钳位（升频路径是增量叠加，可能越过边界）
     if (!(s.currentPerf >= p.perfFloor)) s.currentPerf = p.perfFloor;
     if (s.currentPerf > p.perfCeil) s.currentPerf = p.perfCeil;
-    out.effPerf = s.currentPerf;
-    return out;
+    return emit(delta > 0.0f ? GovDecision::Up : GovDecision::Down);
 }
 
 // 写频最小驻留门：距上次实际落盘是否已满 writeDwellMs。
@@ -286,6 +356,12 @@ inline void LoadGovParams::normalize() {
     perfCeil           = detail::clampf(perfCeil, 0.05f, 1.0f);
     perfFloor          = detail::clampf(perfFloor, 0.0f, perfCeil);
     perfInit           = detail::clampf(perfInit, perfFloor, perfCeil);
+
+    steadyDecayTargetRatio = detail::clampf(steadyDecayTargetRatio, 0.1f, 1.0f);
+    steadyDecayBand        = detail::clampf(steadyDecayBand, 0.0f, 0.2f);
+    steadyDecayStableTicks = detail::clampi(steadyDecayStableTicks, 1, 600);
+    steadyDecayStep        = detail::clampf(steadyDecayStep, 0.0f, 0.2f);
+    steadyDecayMax         = detail::clampf(steadyDecayMax, 0.0f, 0.9f);
 
     upRateLimitTicks   = detail::clampi(upRateLimitTicks, 1, 1000);
     downRateLimitTicks = detail::clampi(downRateLimitTicks, 1, 1000);

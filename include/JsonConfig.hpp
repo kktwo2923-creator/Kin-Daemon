@@ -301,6 +301,8 @@ public:
         AutoMode::loadgov_up_pct = 88; AutoMode::loadgov_down_pct = 62;
         AutoMode::loadgov_headroom_pct = 120; AutoMode::loadgov_smooth_up_pct = 60;
         AutoMode::loadgov_deadzone_pct = 3; AutoMode::loadgov_dwell_ms = 0;
+        AutoMode::loadgov_steady_enable = true; AutoMode::loadgov_steady_target_pct = 90;
+        AutoMode::loadgov_steady_step_x1000 = 10; AutoMode::loadgov_steady_max_pct = 25;
         AutoMode::fas_loading_enable = true; AutoMode::fas_loading_perf_pct = 70;
         AutoMode::fas_gear_dwell_frames = 120;
         AutoMode::cool_lean = ""; AutoMode::battery_bias = 0;
@@ -698,6 +700,16 @@ private:
                     AutoMode::loadgov_deadzone_pct = 3;
                 if (AutoMode::loadgov_dwell_ms < 0 || AutoMode::loadgov_dwell_ms > 5000)
                     AutoMode::loadgov_dwell_ms = 0;
+                readBool(a, "loadgov_steady_enable", AutoMode::loadgov_steady_enable);
+                readInt (a, "loadgov_steady_target_pct", AutoMode::loadgov_steady_target_pct);
+                if (AutoMode::loadgov_steady_target_pct < 10 || AutoMode::loadgov_steady_target_pct > 100)
+                    AutoMode::loadgov_steady_target_pct = 90;
+                readInt (a, "loadgov_steady_step_x1000", AutoMode::loadgov_steady_step_x1000);
+                if (AutoMode::loadgov_steady_step_x1000 < 1 || AutoMode::loadgov_steady_step_x1000 > 200)
+                    AutoMode::loadgov_steady_step_x1000 = 10;
+                readInt (a, "loadgov_steady_max_pct", AutoMode::loadgov_steady_max_pct);
+                if (AutoMode::loadgov_steady_max_pct < 0 || AutoMode::loadgov_steady_max_pct > 90)
+                    AutoMode::loadgov_steady_max_pct = 25;
                 readBool(a, "fas_loading_enable", AutoMode::fas_loading_enable);
                 readInt (a, "fas_loading_perf_pct", AutoMode::fas_loading_perf_pct);
                 if (AutoMode::fas_loading_perf_pct < 30 || AutoMode::fas_loading_perf_pct > 100)
