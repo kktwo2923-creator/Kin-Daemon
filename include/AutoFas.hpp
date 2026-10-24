@@ -166,6 +166,15 @@ public:
                nowMs - engageMs_ < 8000;
     }
 
+    // ── 帧级分析对外状态（供 auto_status.txt 上报给 App）────────────────────
+    // 只暴露"现在是哪种模式、有没有在压"这类可判定值，不暴露内部计数器，
+    // 避免 App 把中间态当成硬件写确认（见 STATUS_PROTOCOL.md 的 ownership boundary）。
+    bool frameAnalysisOn()   const { return frameOn_; }
+    bool loadingActive()     const { return loading_.loading; }
+    int  postGuardFrames()   const { return loading_.postGuard; }
+    int  gearDwellFrames()   const { return gear_.framesSinceUpgrade; }
+    bool usingPerFrame()     const { return haveFrames_; }   // true=dumpsys 逐帧, false=measured_fps 窗口
+
     // ──────────── 每 tick: 喂帧 + 计算上限 ────────────
     // sysLoadW: 能效加权整机负载%(-1=未知)。用于并发防劣化(GearDVFS 教训): 只盯前台单游戏帧率
     // 的闭环在有后台重负载时会误压 scaling_max 饿死后台 —— 帧达标但整机负载很高时不再下压, 交回静态档。

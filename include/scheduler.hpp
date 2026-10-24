@@ -2138,9 +2138,27 @@ public:
                 } else {
                     dnd_.release();
                 }
-                if (fsmDue) autoMode_.writeFsmStatus(mx, alpha, autoFsm_.stateName(),
-                                         capsToWrite.maxL / 1000, capsToWrite.maxB / 1000,
-                                         policyResolver.result(), fasEngaged, fengchiActive);
+                if (fsmDue) {
+                    // 附加运行态（闭环 + 帧级分析）—— 只上报可判定值，不上报内部计数器。
+                    // loadgov_perf 用 **x1000 性能比**而不是 kHz：它表达的是"闭环意图"，
+                    // 与 cpu_max_*（最终落盘值）不等时，说明被 FAS/类别/热/PolicyResolver 又收紧了。
+                    AutoModeCtl::AuxRuntime aux;
+                    aux.loadGovEnable   = Config::AutoMode::loadgov_enable;
+                    aux.loadGovBusyL    = mx.clusterBusy[0];
+                    aux.loadGovBusyB    = mx.clusterBusy[1];
+                    aux.loadGovPerfLX1000 = loadGovPrimed_[0]
+                        ? (int)(loadGov_[0].currentPerf * 1000.0f + 0.5f) : -1;
+                    aux.loadGovPerfBX1000 = loadGovPrimed_[1]
+                        ? (int)(loadGov_[1].currentPerf * 1000.0f + 0.5f) : -1;
+                    aux.fasFrameAnalysis = autoFas_.frameAnalysisOn();
+                    aux.fasLoading       = autoFas_.loadingActive();
+                    aux.fasPostGuard     = autoFas_.postGuardFrames();
+                    aux.fasGearDwell     = autoFas_.gearDwellFrames();
+                    aux.fasPerFrame      = autoFas_.usingPerFrame();
+                    autoMode_.writeFsmStatus(mx, alpha, autoFsm_.stateName(),
+                                             capsToWrite.maxL / 1000, capsToWrite.maxB / 1000,
+                                             policyResolver.result(), fasEngaged, fengchiActive, aux);
+                }
                 // 自适应 tick(省唤醒): 息屏 30s; FAS 接管/预热期按 FAS 轮询节奏(200ms 闭环,
                 // measured_fps ~1s 窗口, 5Hz 足够; 预热若 8s 没接管则 warmingUp 放弃快节奏);
                 // 亮屏其余情形: 负载闭环开启时用 loadgov_tick_ms(缺省 600ms), 否则回旧口径

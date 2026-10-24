@@ -74,6 +74,22 @@ public:
 
     struct PwrSample { long ts; int level, curMa, voltMv, tempDc, chg, screen; };
 
+    // 附加运行态：不由本类产生，而是调度层把闭环/帧级分析的状态传进来一起上报。
+    // 全字段都是 bool/int —— 不引入任何外部文本，保证状态协议里不会出现注入面。
+    // 默认值 = "未启用/无数据"，因此老调用点（不传 aux）行为逐位不变。
+    struct AuxRuntime {
+        bool loadGovEnable     = false;
+        int  loadGovBusyL      = -1;   // 小核簇最忙核 busy%，-1=未接管/读不到
+        int  loadGovBusyB      = -1;
+        int  loadGovPerfLX1000 = -1;   // 闭环算出的小核上限（x1000 性能比），-1=未接管
+        int  loadGovPerfBX1000 = -1;
+        bool fasFrameAnalysis  = false;  // 帧级分析开关
+        bool fasLoading        = false;  // 当前是否在读条/过图
+        int  fasPostGuard      = 0;      // 加载后保护期剩余帧数
+        int  fasGearDwell      = 0;      // 升档后已驻留帧数
+        bool fasPerFrame       = false;  // true=逐帧(dumpsys)，false=窗口(measured_fps)
+    };
+
     explicit AutoModeCtl(Logger& lg) : logger_(lg) {}
 
     // 供 AutoFas 复用缓存 fd 读 measured_fps(专用 slot 16, 单 pread, 无 open/close)。
@@ -366,8 +382,11 @@ public:
     }
 
     // FSM 模式下的实时状态(含 FSM 状态名与本 tick 频率上限)
+    // aux 无默认实参：嵌套结构的默认成员初始值在类内声明点还不可用
+    // （C++ 的 incomplete-class 规则），所以由调用方显式传。
     void writeFsmStatus(const Metrics& m, int alpha, const char* fsmState, int maxL, int maxB,
-                        const kin::PolicyDecision& decision, bool fasEngaged, bool romManaged) {
+                        const kin::PolicyDecision& decision, bool fasEngaged, bool romManaged,
+                        const AuxRuntime& aux) {
         // 状态文件仅供 App 显示(App ~1Hz 轮询)。FAS/游戏档 tick 可达 ~4Hz, 每次都 open+write+close
         // /sdcard(FUSE/sdcardfs)开销大且白白唤醒 → 限到 ~1Hz 写, 与读端节奏对齐。
         {
@@ -400,7 +419,7 @@ public:
         if (n > 0 && (size_t)n < sizeof(buf)) {
             // 这些字段使用固定枚举值，避免把未经校验的外部文本带入状态协议。
             std::string status(buf, (size_t)n);
-            status += "schema_version=2\n";
+            status += "schema_version=3\n";
             status += "seq=" + std::to_string(++fsmStatusSeq_) + "\n";
             status += "timestamp=" + std::to_string((long long)time(nullptr)) + "\n";
             status += "owner=kin_daemon\nreason=smart_policy\nevent=steady\n";
@@ -416,6 +435,26 @@ public:
             status += "\nthermal_state=";
             status += kin::thermalStatus(thermalDecisionC(m), m.skinC, m.headroom,
                                          m.headroomValid, m.hardClamp);
+            status += "\n";
+            // ── 负载闭环（P0-2/P0-3）与 FAS 帧级分析（P1-1）的上报 ──
+            // 口径：这些是**决策目标**，不是硬件写确认（见 STATUS_PROTOCOL.md）。
+            // loadgov_perf_* 是闭环自己算出的该簇上限占硬件最高频的比例（x1000）；
+            // 与 cpu_max_* 的差别正是要能看出来的：cpu_max_* 是最终落盘值（已过 FAS/类别/热/
+            // PolicyResolver），两者不等 = 闭环意图被后层收紧了。
+            status += "loadgov_enable=";
+            status += aux.loadGovEnable ? "1" : "0";
+            status += "\nloadgov_busy_little=" + std::to_string(aux.loadGovBusyL);
+            status += "\nloadgov_busy_big=" + std::to_string(aux.loadGovBusyB);
+            status += "\nloadgov_perf_little=" + std::to_string(aux.loadGovPerfLX1000);
+            status += "\nloadgov_perf_big=" + std::to_string(aux.loadGovPerfBX1000);
+            status += "\nfas_frame_analysis=";
+            status += aux.fasFrameAnalysis ? "1" : "0";
+            status += "\nfas_loading=";
+            status += aux.fasLoading ? "1" : "0";
+            status += "\nfas_post_guard=" + std::to_string(aux.fasPostGuard);
+            status += "\nfas_gear_dwell=" + std::to_string(aux.fasGearDwell);
+            status += "\nfas_frame_source=";
+            status += aux.fasPerFrame ? "per_frame" : "window";
             status += "\n";
             writeFile(kStatusPath, status.c_str(), status.size());
         }
