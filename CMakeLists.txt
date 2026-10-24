@@ -172,6 +172,10 @@ if(BUILD_TESTING AND NOT ANDROID)
     target_include_directories(kin_test_fas_frames PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_fas_frames COMMAND kin_test_fas_frames)
 
+    add_executable(kin_test_energy_model tests/test_energy_model.cpp)
+    target_include_directories(kin_test_energy_model PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME kin_energy_model COMMAND kin_test_energy_model)
+
     add_executable(kin_test_idle_uclamp tests/test_idle_uclamp.cpp)
     target_include_directories(kin_test_idle_uclamp PRIVATE ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME kin_idle_uclamp COMMAND kin_test_idle_uclamp)
