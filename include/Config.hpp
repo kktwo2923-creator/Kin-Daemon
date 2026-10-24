@@ -102,6 +102,13 @@ namespace Config {
         inline int      loadgov_smooth_up_pct = 60; // 升频步长(%)
         inline int      loadgov_deadzone_pct= 3;    // 写频死区(簇硬件最高频的 %)
         inline int      loadgov_dwell_ms    = 0;    // 写频最小驻留(ms, 0=关); 确认窗口已提供 1.8s/1.2s 驻留
+
+        // ── FAS 帧级分析(P1-1, 见 include/FasFrames.hpp) ──
+        // 读条/过图识别 + 加载后保护 + 升档驻留。逐帧数据来自 dumpsys --latency(免费),
+        // 只有 measured_fps 的机型退化成窗口判定(帧率 < 目标 40% 且 GPU 闲)。
+        inline bool     fas_loading_enable      = true;  // 加载态识别总开关
+        inline int      fas_loading_perf_pct    = 70;    // 加载态上限(%), 下限自动取 上限-10
+        inline int      fas_gear_dwell_frames   = 120;   // 升档后最短驻留帧数(60fps ≈ 2s)
         inline int      learn_rate  = 80;     // 学习率(/1000): dt_alpha×此值/1000(ASB LEARN_RATE_X1000=80)
         inline int      drain_high  = 14;     // 亮屏掉电率(%/h) ≥ 此值视为高耗电(学习 +30)
         inline string_t cool_lean;            // 凉爽且低 alpha 时偏好: "performance"=可冲高; 空/其它=最高 balance

@@ -16,6 +16,7 @@
 #include "Config.hpp"
 #include "Logger.hpp"
 #include "AutoFsm.hpp"
+#include "FasFrames.hpp"
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -85,6 +86,10 @@ public:
     void onEnterGaming(const AutoFsm::Caps& seed, long nowMs, int targetOverride = 0) {
         if (active_) return;
         active_ = true; engageMs_ = nowMs; warm_ = 0; ftN_ = 0; ftHead_ = 0;
+        // 帧级分析状态复位：新会话不得带着上一局的加载态/驻留/输出基准
+        loading_ = kin::LoadingState{};
+        gear_    = kin::GearState{};
+        lastOutL_ = 0; lastOutB_ = 0; lastTickMs_ = 0;
         int fixed = (targetOverride > 0) ? targetOverride
                   : (Config::AutoMode::fas_target_fps > 0 ? Config::AutoMode::fas_target_fps : 0);
         emaFpsX10_ = 0; tgtFps_ = fixed;
@@ -169,6 +174,8 @@ public:
              int hwMaxL, int hwMaxB, int gpuPct, int cpuBusy, long nowMs, int sysLoadW = -1) {
         Out o{false, staticCaps.maxL, staticCaps.maxB};
         if (!active_) return o;
+
+        syncFrameParams();   // 配置热重载即时生效（三个 int，每拍读一遍的代价可忽略）
 
         int fpsX10 = readFpsX10(ctl, utils, nowMs);
         if (fpsX10 <= 0) return o;                       // 帧源失效 → 静态回退
@@ -313,6 +320,40 @@ public:
         int outL = fasMaxL_, outB = fasMaxB_;
         if (bigJank && gpuPct < 95) { outL = staticCaps.maxL; outB = staticCaps.maxB; }
 
+        // ── 帧级分析：加载态 / 档位驻留（P1-1）───────────────────────────────
+        // 窗口路径（measured_fps 为主源）没有逐帧事件，用窗口信号驱动同一份加载态。
+        // 逐帧路径已在 readDumpsysFpsX10 里喂过，此处不重复喂（否则同一批帧计两次）。
+        if (frameOn_ && !haveFrames_) {
+            const float dtMs = (lastTickMs_ > 0) ? (float)(nowMs - lastTickMs_) : 0.0f;
+            kin::feedLoadingWindow(loading_, (float)curFps, tgtFps_, gpuPct, dtMs, loadingParams_);
+            // 驻留按窗口内真实帧数推进：60fps × 600ms ≈ 36 帧。
+            // 若按"1 帧/拍"推进，120 帧驻留在 600ms 拍下要 72 秒才走完 = 降档被永久禁止。
+            int framesInWindow = (int)(curFps * (double)dtMs / 1000.0 + 0.5);
+            kin::gearTickFrames(gear_, gearParams_, nowMs, framesInWindow);
+        }
+        lastTickMs_ = nowMs;
+
+        // 加载态：读条/过图压着跑（钳到 [perfFloor, perfCeiling]），别浪费满频
+        const float loadOv = kin::loadingPerfOverride(loading_, loadingParams_);
+        if (loadOv > 0.0f && hwMaxL > 0 && hwMaxB > 0) {
+            const int capL = (int)(loadOv * (float)hwMaxL);
+            const int capB = (int)(loadOv * (float)hwMaxB);
+            if (capL < outL) outL = capL;
+            if (capB < outB) outB = capB;
+        }
+        // 快升慢降：升档后驻留期内 + 加载后保护期内禁止降档（防读条结束瞬间的频率断崖）。
+        // 注意排除 loading_ 本身 —— 加载态的上限压制**就是一次降档**，不能把它挡回去。
+        const bool holdOutput = !loading_.loading &&
+                                (loading_.postGuard > 0 || !kin::gearAllowsDowngrade(gear_, gearParams_));
+        if (holdOutput) {
+            if (lastOutL_ > 0 && outL < lastOutL_) outL = lastOutL_;
+            if (lastOutB_ > 0 && outB < lastOutB_) outB = lastOutB_;
+        }
+        // 显著抬升才记一次"升档"（否则每个 +1kHz 噪声都会重置驻留，等价于永不降档）
+        if (lastOutL_ > 0 && outL > lastOutL_ + lastOutL_ / 32) kin::gearNoteUpgrade(gear_);
+        else if (lastOutB_ > 0 && outB > lastOutB_ + lastOutB_ / 32) kin::gearNoteUpgrade(gear_);
+        lastOutL_ = outL; lastOutB_ = outB;
+
         // 自适应轮询(快追帧/省唤醒): 掉帧→加快查; 稳态明显高于目标(用稳态长窗)→放慢省电; 否则常速。
         pollMs_ = janked ? POLL_JANK_MS
                 : (meanFps > (double)tgtFps_ + marginFps() ? POLL_CALM_MS : POLL_NORM_MS);
@@ -323,6 +364,21 @@ public:
 
 private:
     enum Src { SRC_NONE, SRC_SYSFS, SRC_DUMPSYS };
+
+    // 把 config.json 的 FAS 帧级参数同步进来（每拍调一次，纯值类型）。
+    // fas_loading_enable=false 时把累计窗口设成极大值 + 关闭 perf 覆盖，等价于退回纯 P 控制器。
+    void syncFrameParams() {
+        const bool en = Config::AutoMode::fas_loading_enable;
+        const int pct = Config::AutoMode::fas_loading_perf_pct;
+        // 关掉时：perfCeiling=0 让 loadingPerfOverride 恒返回"不覆盖"，
+        // 驻留帧数=0 让 gearAllowsDowngrade 恒 true，并且**不再喂帧**（frameOn_ 门控）
+        // —— 三者齐备才是真正的逐位回退；只关其中一项会让加载态照样冻结输出。
+        frameOn_ = en;
+        loadingParams_.perfCeiling = (float)pct / 100.0f;
+        loadingParams_.perfFloor   = (float)(pct - 10) / 100.0f;
+        if (loadingParams_.perfFloor < 0.0f) loadingParams_.perfFloor = 0.0f;
+        gearParams_.minDwellFrames = en ? Config::AutoMode::fas_gear_dwell_frames : 0;
+    }
     Logger& logger_;
     bool probed_ = false; Src src_ = SRC_NONE;
     const char* fpsPath_ = nullptr;
@@ -343,6 +399,17 @@ private:
     static constexpr int kMaxThreads = 256;                       // 游戏线程通常 <100, 256 兜底
     ThrCpu thrTab_[kMaxThreads] = {}; int thrN_ = 0;              // 上次采样快照(算增量)
     long dumpLastMs_ = 0; int dumpFpsX10_ = 0; char dumpLayer_[256] = {0};
+    // ── 帧级分析（P1-1）────────────────────────────────────────────────────
+    // 加载态（读条/过图）与档位驻留。逐帧路径走 feedLoadingFrame（--latency 免费拿到），
+    // 窗口路径（只有 measured_fps）走 feedLoadingWindow。两者驱动同一份状态。
+    kin::LoadingParams loadingParams_;
+    kin::LoadingState  loading_;
+    kin::GearParams    gearParams_;
+    kin::GearState     gear_;
+    bool  frameOn_     = true;               // 帧级分析总开关（config fas_loading_enable）
+    bool  haveFrames_  = false;              // 本会话是否用过逐帧路径（dumpsys 兜底设备才有）
+    int   lastOutL_    = 0, lastOutB_ = 0;   // 上一拍实际输出（加载后保护期"禁止降档"的基准）
+    long  lastTickMs_  = 0;                  // 上一拍时刻（窗口路径折算 dt 用）
     long layerProbeMs_ = 0; bool layerSeen_ = false;   // hasGameLayer 节流缓存
 
     // 前台进程最忙线程的单核 CPU 时间比例(移植 fas-rs v4.4 process_monitor util_max):
@@ -496,6 +563,19 @@ private:
         double fps = fpsFromLatencyBlock(out);
         if (fps <= 0) { dumpLayer_[0] = '\0'; dumpFpsX10_ = 0; return -1; }
         dumpFpsX10_ = (int)(fps * 10.0 + 0.5);
+
+        // ── 逐帧喂入（P1-1）────────────────────────────────────────────────
+        // 这块文本本来就已经读进来了，拆回逐帧是零额外 IO。
+        // ChiRi 硬教训「帧投喂必须全量」：只喂末条会把 100ms 窗口内 6 帧丢 5 帧，
+        // 所有"帧数"常数的时间尺度被拉长 ~6 倍，加载态判定与驻留全部钝化。
+        kin::FrameBatch batch;
+        if (frameOn_ && kin::parseLatencyFrames(out, batch, loadingParams_.heavyFrameMs)) {
+            haveFrames_ = true;
+            for (int i = 0; i < batch.n; ++i) {
+                kin::feedLoadingFrame(loading_, batch.deltaMs[i], loadingParams_);
+                kin::gearTick(gear_, gearParams_, nowMs);
+            }
+        }
         return dumpFpsX10_;
     }
 
